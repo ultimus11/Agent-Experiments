@@ -8,66 +8,97 @@ from langchain.tools import tool
 from langchain_openai import ChatOpenAI
 from langchain.agents import AgentExecutor, create_structured_chat_agent
 import agentops
-from agentops import init, end_session
 from agentops.langchain_callback_handler import LangchainCallbackHandler as AgentOpsLangchainCallbackHandler
+from typing import List, Dict, Any, Optional
 
-# Load environment variables
 load_dotenv()
 
-# Spotify API credentials
-client_id = os.environ['Spotify_Client']
-client_secret = os.environ['Spotify_Secret']
+client_id: str = os.environ.get('Spotify_Client', '')
+client_secret: str = os.environ.get('Spotify_Secret', '')
 
-# AgentOps API Key
-agent_ops_keys=os.environ['AGENT_OPS_KEY']
-# Setting up Spotify client
-spotify_client = spotipy.Spotify(client_credentials_manager=SpotifyClientCredentials(client_id=client_id, client_secret=client_secret))
+agent_ops_keys: str = os.environ.get('AGENT_OPS_KEY', '')
+
+if not client_id or not client_secret:
+    raise ValueError("Spotify_Client or Spotify_Secret environment variables are not set. "
+                     "Please ensure they are defined in your .env file or environment.")
+spotify_client: spotipy.Spotify = spotipy.Spotify(
+    client_credentials_manager=SpotifyClientCredentials(client_id=client_id, client_secret=client_secret)
+)
+
+agentops_handler: Optional[AgentOpsLangchainCallbackHandler] = None
+if agent_ops_keys:
+    agentops.init(api_key=agent_ops_keys)
+    agentops_handler = AgentOpsLangchainCallbackHandler(api_key=agent_ops_keys, tags=[' New Music Agent'])
+else:
+    print("Warning: AGENT_OPS_KEY environment variable not set. AgentOps monitoring will be disabled.")
+
+SPOTIFY_TOP_TRACKS_LIMIT: int = 10
 
 def retrieve_artist_id(artist_name: str) -> str:
-    """Retrieve the Spotify ID of an artist given their name."""
-    results = spotify_client.search(q='artist:' + artist_name, type='artist')
-    items = results['artists']['items']
+    results: Dict[str, Any] = spotify_client.search(q='artist:' + artist_name, type='artist')
+    items: List[Dict[str, Any]] = results['artists']['items']
     if not items:
         raise ValueError(f"No artist found with name {artist_name}")
     return items[0]['id']
 
-def retrieve_tracks(artist_id: str, num_tracks: int) -> list:
-    """Retrieve the top tracks of an artist given their Spotify ID."""
-    top_tracks = spotify_client.artist_top_tracks(artist_id)
+def retrieve_tracks(artist_id: str, num_tracks: int) -> List[str]:
+    top_tracks: Dict[str, Any] = spotify_client.artist_top_tracks(artist_id)
     return [track['name'] for track in top_tracks['tracks'][:num_tracks]]
 
 @tool
-def get_music_recommendations(artists: list, tracks: int) -> list:
-    """Get music recommendations based on a list of artists and the number of tracks requested."""
-    final_tracks = []
+def get_music_recommendations(artists: List[str], tracks: int) -> List[str]:
+    final_tracks: List[str] = []
     for artist in artists:
-        artist_id = retrieve_artist_id(artist)
-        artist_tracks = retrieve_tracks(artist_id, min(tracks, 10))
-        final_tracks.extend(artist_tracks)
+        try:
+            artist_id: str = retrieve_artist_id(artist)
+            artist_tracks: List[str] = retrieve_tracks(artist_id, SPOTIFY_TOP_TRACKS_LIMIT)
+            final_tracks.extend(artist_tracks)
+        except ValueError as e:
+            print(f"Skipping artist '{artist}' due to error: {e}")
+        except Exception as e:
+            print(f"An unexpected error occurred for artist '{artist}': {e}")
+    
     random.shuffle(final_tracks)
     return final_tracks[:tracks]
 
-# Initialize AgentOps
-agentops_handler = AgentOpsLangchainCallbackHandler(api_key=agent_ops_keys, tags=[' New Music Agent'])
-agentops.init(api_key=agent_ops_keys)
+def run_music_agent(input_query: str) -> Dict[str, Any]:
+    llm_callbacks: List[Any] = []
+    if agentops_handler:
+        llm_callbacks.append(agentops_handler)
 
-# Initialize LLM with OpenAI's API
-llm = ChatOpenAI(temperature=0.0, callbacks=[agentops_handler])
-tools = [get_music_recommendations]
+    llm = ChatOpenAI(temperature=0.0, callbacks=llm_callbacks)
+    
+    tools = [get_music_recommendations]
 
-# Pull the prompt from LangChain hub
-prompt = hub.pull("hwchase17/structured-chat-agent")
+    prompt = hub.pull("hwchase17/structured-chat-agent")
 
-# Create the agent with LangChain using the pulled prompt
-agent = create_structured_chat_agent(llm, tools, prompt)
+    agent = create_structured_chat_agent(llm, tools, prompt)
 
-# Create the executor with AgentOps tracking
-executor = AgentExecutor(agent=agent, tools=tools, verbose=True)
+    executor = AgentExecutor(agent=agent, tools=tools, verbose=True)
 
-# Invoke the agent
-input_data = {"input": "I like the following artists: Drake, Future. Can I get 5 song recommendations?"}
-response = executor.invoke(input_data)
-print(response)
+    input_data: Dict[str, str] = {"input": input_query}
+    response: Dict[str, Any] = executor.invoke(input_data)
+    
+    return response
 
-# End the AgentOps session
-agentops.end_session('Success')
+if __name__ == "__main__":
+    try:
+        input_query_example: str = "I like the following artists: Drake, Future. Can I get 5 song recommendations?"
+        print(f"--- Running Music Agent with query: '{input_query_example}' ---")
+        
+        agent_response = run_music_agent(input_query_example)
+        
+        print("\n--- Agent Final Response ---")
+        print(agent_response)
+
+        if agent_ops_keys:
+            agentops.end_session('Success')
+        
+    except ValueError as ve:
+        print(f"Configuration Error: {ve}")
+        if agent_ops_keys:
+            agentops.end_session('Failure', reason=f"Configuration Error: {ve}")
+    except Exception as e:
+        print(f"An unexpected error occurred during agent execution: {e}")
+        if agent_ops_keys:
+            agentops.end_session('Failure', reason=f"Unexpected Error: {e}")
